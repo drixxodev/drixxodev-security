@@ -1,0 +1,142 @@
+// Prisma schema for the managed-middleman automation platform.
+// See CLAUDE.md §5 for the data model spec.
+// Tokens are NEVER stored in plaintext — always encrypted (§7.2).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum ClientStatus {
+  active
+  paused
+}
+
+enum ConnectionProvider {
+  gmail
+  slack
+}
+
+enum ConnectionStatus {
+  active
+  expired
+  revoked
+}
+
+enum AutomationType {
+  email_triage
+}
+
+enum RunStatus {
+  pending
+  running
+  succeeded
+  failed
+}
+
+// ---------------------------------------------------------------------------
+// Models
+// ---------------------------------------------------------------------------
+
+// Operator — the person running the platform (just one for now; extensible later).
+model Operator {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Client — a business the operator serves.
+model Client {
+  id           String       @id @default(cuid())
+  name         String
+  contactEmail String       @unique
+  status       ClientStatus @default(active)
+  plan         String       @default("starter")
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  connections   Connection[]
+  automations   Automation[]
+  usageCounters UsageCounter[]
+}
+
+// Connection — one per (client × provider). Tokens stored ENCRYPTED (§7.2).
+// encryptedAccessToken and encryptedRefreshToken hold ciphertext produced by
+// lib/crypto.ts encrypt(); decrypted only in-memory at call time, never logged.
+model Connection {
+  id                    String             @id @default(cuid())
+  clientId              String
+  provider              ConnectionProvider
+  encryptedAccessToken  String // AES-256-GCM ciphertext (§6.2)
+  encryptedRefreshToken String? // nullable — some providers don't issue one
+  tokenExpiresAt        DateTime?
+  scopes                String[] // list of granted OAuth scopes
+  status                ConnectionStatus   @default(active)
+  createdAt             DateTime           @default(now())
+  updatedAt             DateTime           @updatedAt
+
+  client Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  // One connection per client per provider
+  @@unique([clientId, provider])
+}
+
+// Automation — a configured automation for a client.
+model Automation {
+  id           String         @id @default(cuid())
+  clientId     String
+  type         AutomationType
+  config       Json // provider-specific config (e.g. poll interval, label names)
+  enabled      Boolean        @default(true)
+  pollInterval Int            @default(300) // seconds between polls; webhooks can override later
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+
+  client Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  runs   Run[]
+}
+
+// Run — one execution of an automation.
+model Run {
+  id            String    @id @default(cuid())
+  automationId  String
+  status        RunStatus @default(pending)
+  inputSummary  String? // brief human-readable description of what was processed
+  outputSummary String? // brief description of what was written back
+  llmProvider   String? // e.g. "anthropic", "openai"
+  tokensUsed    Int?
+  costUsd       Float? // computed from provider pricing
+  startedAt     DateTime  @default(now())
+  finishedAt    DateTime?
+  error         String? // error message if status = failed
+
+  automation Automation @relation(fields: [automationId], references: [id], onDelete: Cascade)
+}
+
+// UsageCounter — per client per month; enforces cost caps (§6.5, §8.2).
+model UsageCounter {
+  id            String   @id @default(cuid())
+  clientId      String
+  month         String // "YYYY-MM" e.g. "2026-05"
+  callsUsed     Int      @default(0)
+  callsIncluded Int      @default(500) // monthly cap; overage pauses or bills (§8.2)
+  costUsd       Float    @default(0.0)
+  capUsd        Float    @default(10.0) // hard dollar cap before pausing
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  client Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  // One counter per client per calendar month
+  @@unique([clientId, month])
+}
